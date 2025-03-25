@@ -11,6 +11,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	"github.com/go-resty/resty/v2"
 )
 
@@ -18,47 +19,46 @@ import (
 var (
 	_ caddy.Module                       = (*HealthCheck)(nil)
 	_ caddy.Provisioner                  = (*HealthCheck)(nil)
-	_ caddyhttp.MiddlewareHandler          = (*HealthCheck)(nil)
+	_ reverseproxy.ConfigChecker          = (*HealthCheck)(nil) // реализуем интерфейс ConfigChecker
 	_ caddyfile.Unmarshaler                = (*HealthCheck)(nil)
 )
 
 // HealthCheck представляет конфигурацию модуля healthcheck.
 type HealthCheck struct {
-	Upstream        string        `json:"upstream"`
-	HealthURI       string        `json:"health_uri"`
-	Interval        string        `json:"interval"`
-	Timeout         string        `json:"timeout"`
-	HealthBody      string        `json:"health_body"`
-	SlackWebhookURL string        `json:"slack_webhook_url"` // Добавляем поле для Slack Webhook URL
-	EndpointStatuses map[string]bool `json:"-"`
+	Upstream        string `json:"upstream"`
+	HealthURI       string `json:"health_uri"`
+	Interval        string `json:"interval"`
+	Timeout         string `json:"timeout"`
+	HealthBody      string `json:"health_body"`
+    	SlackWebhookURL string `json:"slack_webhook_url"`
+	EndpointStatuses map[string]bool    `json:"-"`
 	intervalDuration time.Duration
 	timeoutDuration  time.Duration
 	mu             sync.Mutex
 	transport      http.RoundTripper
 }
 
-// CaddyModule возвращает информацию о модуле Caddy.
+// CaddyModule returns module information.
 func (HealthCheck) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.reverse_proxy.healthcheck",
+		ID: "http.reverse_proxy.health_check",
 		New: func() caddy.Module { return new(HealthCheck) },
 	}
 }
 
-// Provision инициализирует HealthCheck, преобразуя интервалы и устанавливая начальные состояния.
+// Provision sets up the health check module.
 func (h *HealthCheck) Provision(ctx caddy.Context) error {
 	var err error
 	h.intervalDuration, err = time.ParseDuration(h.Interval)
 	if err != nil {
-		return fmt.Errorf("invalid interval duration: %w", err)
+		return fmt.Errorf("invalid interval: %w", err)
 	}
-
 	h.timeoutDuration, err = time.ParseDuration(h.Timeout)
 	if err != nil {
-		return fmt.Errorf("invalid timeout duration: %w", err)
+		return fmt.Errorf("invalid timeout: %w", err)
 	}
 
-	h.EndpointStatuses = make(map[string]bool)
+    h.EndpointStatuses = make(map[string]bool)
 	h.EndpointStatuses[h.Upstream] = true // Изначально считаем все доступными
 
 	go h.startHealthChecks()
@@ -66,23 +66,12 @@ func (h *HealthCheck) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Validate проверяет конфигурацию после Provision.
-func (h *HealthCheck) Validate() error {
-	if h.Upstream == "" {
-		return fmt.Errorf("upstream endpoint must be specified")
-	}
-	if h.HealthURI == "" {
-		return fmt.Errorf("health_uri must be specified")
-	}
-	return nil
-}
-
-// UnmarshalCaddyfile реализует caddyfile.Unmarshaler.
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "health_uri":
+			case "uri":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
@@ -97,7 +86,7 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.Timeout = d.Val()
-			case "health_body":
+			case "body":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
@@ -107,22 +96,26 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.Upstream = d.Val()
-			case "slack_webhook_url": // Добавляем обработку slack_webhook_url
+            case "slack_webhook_url": // Добавляем обработку slack_webhook_url
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				h.SlackWebhookURL = d.Val()
 			default:
-				return d.Errf("unknown subdirective %s", d.Val())
+				return d.Errf("unknown option '%s'", d.Val())
 			}
 		}
 	}
 	return nil
 }
 
-// ServeHTTP реализует caddyhttp.MiddlewareHandler.
-func (h HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	return next.ServeHTTP(w, r)
+// CheckConfig implements reverseproxy.ConfigChecker.  It is called during
+// configuration to validate the health check config.
+func (h *HealthCheck) CheckConfig(hc *reverseproxy.Handler) error {
+	// This method is intentionally left blank.  We don't need to do any
+	// special configuration checks beyond what's done in Provision and
+	// UnmarshalCaddyfile.
+	return nil
 }
 
 // startHealthChecks запускает периодические проверки доступности endpoints.
