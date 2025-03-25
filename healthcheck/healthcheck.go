@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -17,10 +18,11 @@ import (
 
 // Interface guards
 var (
-	_ caddy.Module                       = (*HealthCheck)(nil)
-	_ caddy.Provisioner                  = (*HealthCheck)(nil)
-	_ caddyhttp.MiddlewareHandler          = (*HealthCheck)(nil)
-	_ caddyfile.Unmarshaler                = (*HealthCheck)(nil)
+	_ caddy.Module              = (*HealthCheck)(nil)
+	_ caddy.Provisioner         = (*HealthCheck)(nil)
+	_ caddyhttp.MiddlewareHandler = (*HealthCheck)(nil)
+    _ reverseproxy.ConfigChecker          = (*HealthCheck)(nil) // реализуем интерфейс ConfigChecker
+	_ caddyfile.Unmarshaler     = (*HealthCheck)(nil)
 )
 
 // HealthCheck ... (остальной код без изменений, кроме UnmarshalCaddyfile) ...
@@ -195,6 +197,11 @@ func (h *HealthCheck) sendSlackNotification(message string, slackURL string) err
 
 	return err
 }
+
+func (h *HealthCheck) CheckConfig(handler *reverseproxy.Handler) error {
+    return nil
+}
+
 func init() {
 	caddy.RegisterModule(HealthCheck{})
 }
