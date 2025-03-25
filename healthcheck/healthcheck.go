@@ -20,6 +20,7 @@ var (
 	_ caddy.Module                       = (*HealthCheck)(nil)
 	_ caddy.Provisioner                  = (*HealthCheck)(nil)
 	_ reverseproxy.ConfigChecker          = (*HealthCheck)(nil) // реализуем интерфейс ConfigChecker
+    _ caddyhttp.MiddlewareHandler = (*HealthCheck)(nil)
 	_ caddyfile.Unmarshaler                = (*HealthCheck)(nil)
 )
 
@@ -30,7 +31,6 @@ type HealthCheck struct {
 	Interval        string `json:"interval"`
 	Timeout         string `json:"timeout"`
 	HealthBody      string `json:"health_body"`
-    	SlackWebhookURL string `json:"slack_webhook_url"`
 	EndpointStatuses map[string]bool    `json:"-"`
 	intervalDuration time.Duration
 	timeoutDuration  time.Duration
@@ -67,15 +67,14 @@ func (h *HealthCheck) Provision(ctx caddy.Context) error {
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
+        if !d.Args(&h.HealthURI) {
+            return d.ArgErr()
+        }
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "uri":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.HealthURI = d.Val()
 			case "interval":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -96,11 +95,6 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.Upstream = d.Val()
-            case "slack_webhook_url": // Добавляем обработку slack_webhook_url
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.SlackWebhookURL = d.Val()
 			default:
 				return d.Errf("unknown option '%s'", d.Val())
 			}
@@ -112,9 +106,6 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // CheckConfig implements reverseproxy.ConfigChecker.  It is called during
 // configuration to validate the health check config.
 func (h *HealthCheck) CheckConfig(hc *reverseproxy.Handler) error {
-	// This method is intentionally left blank.  We don't need to do any
-	// special configuration checks beyond what's done in Provision and
-	// UnmarshalCaddyfile.
 	return nil
 }
 
@@ -153,13 +144,6 @@ func (h *HealthCheck) checkEndpoint(upstream string) {
 		}
 
 		log.Println(message)
-
-		// Отправляем уведомление в Slack, если URL настроен
-		if h.SlackWebhookURL != "" {
-			if err := h.sendSlackNotification(message); err != nil {
-				log.Printf("[ERROR] Failed to send Slack notification: %v", err)
-			}
-		}
 	}
 }
 
@@ -191,17 +175,8 @@ func (h *HealthCheck) isEndpointAvailable(upstream string) (bool, error) {
 	return false, nil
 }
 
-// sendSlackNotification отправляет сообщение в Slack через webhook.
-func (h *HealthCheck) sendSlackNotification(message string) error {
-	payload := map[string]string{"text": message}
-
-	client := resty.New()
-	_, err := client.R().
-		SetHeader("Content-Type", "application/json").
-		SetBody(payload).
-		Post(h.SlackWebhookURL)
-
-	return err
+func (h *HealthCheck) ServeHTTP(rw http.ResponseWriter, req *http.Request, next caddyhttp.Handler) error {
+	return next.ServeHTTP(rw, req)
 }
 
 func init() {
