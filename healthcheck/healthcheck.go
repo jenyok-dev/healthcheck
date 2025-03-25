@@ -16,18 +16,20 @@ import (
 
 // Interface guards
 var (
-	_ caddy.Module          = (*HealthCheck)(nil)
-	_ caddy.Provisioner     = (*HealthCheck)(nil)
-	_ caddyhttp.MiddlewareHandler = (*HealthCheck)(nil)
-	_ caddyfile.Unmarshaler = (*HealthCheck)(nil)
+	_ caddy.Module                       = (*HealthCheck)(nil)
+	_ caddy.Provisioner                  = (*HealthCheck)(nil)
+	_ caddyhttp.MiddlewareHandler          = (*HealthCheck)(nil)
+	_ caddyfile.Unmarshaler                = (*HealthCheck)(nil)
 )
+
 // HealthCheck представляет конфигурацию модуля healthcheck.
 type HealthCheck struct {
-	Upstream      string      `json:"upstream"`
-	HealthURI     string        `json:"health_uri"`
-	Interval      string        `json:"interval"`
-	Timeout       string        `json:"timeout"`
-	HealthBody    string        `json:"health_body"`
+	Upstream        string        `json:"upstream"`
+	HealthURI       string        `json:"health_uri"`
+	Interval        string        `json:"interval"`
+	Timeout         string        `json:"timeout"`
+	HealthBody      string        `json:"health_body"`
+	SlackWebhookURL string        `json:"slack_webhook_url"` // Добавляем поле для Slack Webhook URL
 	EndpointStatuses map[string]bool `json:"-"`
 	intervalDuration time.Duration
 	timeoutDuration  time.Duration
@@ -105,6 +107,11 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				h.Upstream = d.Val()
+			case "slack_webhook_url": // Добавляем обработку slack_webhook_url
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.SlackWebhookURL = d.Val()
 			default:
 				return d.Errf("unknown subdirective %s", d.Val())
 			}
@@ -113,7 +120,7 @@ func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// ServeHTTP реализует caddyhttp.MiddlewareHandler. Он просто передает запрос дальше по цепочке.
+// ServeHTTP реализует caddyhttp.MiddlewareHandler.
 func (h HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	return next.ServeHTTP(w, r)
 }
@@ -154,6 +161,12 @@ func (h *HealthCheck) checkEndpoint(upstream string) {
 
 		log.Println(message)
 
+		// Отправляем уведомление в Slack, если URL настроен
+		if h.SlackWebhookURL != "" {
+			if err := h.sendSlackNotification(message); err != nil {
+				log.Printf("[ERROR] Failed to send Slack notification: %v", err)
+			}
+		}
 	}
 }
 
@@ -185,6 +198,18 @@ func (h *HealthCheck) isEndpointAvailable(upstream string) (bool, error) {
 	return false, nil
 }
 
+// sendSlackNotification отправляет сообщение в Slack через webhook.
+func (h *HealthCheck) sendSlackNotification(message string) error {
+	payload := map[string]string{"text": message}
+
+	client := resty.New()
+	_, err := client.R().
+		SetHeader("Content-Type", "application/json").
+		SetBody(payload).
+		Post(h.SlackWebhookURL)
+
+	return err
+}
 
 func init() {
 	caddy.RegisterModule(HealthCheck{})
