@@ -2,10 +2,7 @@ module github.com/jenyok-dev/healthcheck/healthcheck
 
 go 1.22.3
 
-require (
-	github.com/caddyserver/caddy/v2 v2.9.1
-	github.com/go-resty/resty/v2 v2.9.1
-)
+require github.com/caddyserver/caddy/v2 v2.9.1
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
