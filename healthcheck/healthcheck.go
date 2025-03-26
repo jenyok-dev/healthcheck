@@ -1,9 +1,7 @@
 package healthcheck
 
 import (
-	"context"
 	"log"
-
 	"github.com/caddyserver/caddy/v2"
 )
 
