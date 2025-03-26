@@ -1,8 +1,10 @@
 package healthcheck
 
 import (
+	"context" // Нужен для UpstreamHealthChecker
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -11,197 +13,264 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy" // Нужен для интерфейса и Upstream
 	"github.com/go-resty/resty/v2"
 )
 
-// Interface guards
-var (
-	_ caddy.Module              = (*HealthCheck)(nil)
-	_ caddy.Provisioner         = (*HealthCheck)(nil)
-	_ caddyhttp.MiddlewareHandler = (*HealthCheck)(nil)
-    _ reverseproxy.ConfigChecker          = (*HealthCheck)(nil) // реализуем интерфейс ConfigChecker
-	_ caddyfile.Unmarshaler     = (*HealthCheck)(nil)
-)
+func init() {
+	// Регистрируем наш модуль как тип health checker'а
+	caddy.RegisterModule(SlackNotifierHealthChecker{})
+}
 
-// HealthCheck ... (остальной код без изменений, кроме UnmarshalCaddyfile) ...
-type HealthCheck struct {
-	Upstream        string `json:"upstream"`
-	HealthURI       string `json:"health_uri"`
-	Interval        string `json:"interval"`
-	Timeout         string `json:"timeout"`
-	HealthBody      string `json:"health_body"`
-    SlackWebhookURL string `json:"slack_webhook_url"`
-	EndpointStatuses map[string]bool    `json:"-"`
-	intervalDuration time.Duration
-	timeoutDuration  time.Duration
+// SlackNotifierHealthChecker реализует reverseproxy.UpstreamHealthChecker
+// и добавляет уведомления в Slack.
+type SlackNotifierHealthChecker struct {
+	URI             string         `json:"uri,omitempty"`
+	Interval        caddy.Duration `json:"interval,omitempty"`
+	Timeout         caddy.Duration `json:"timeout,omitempty"`
+	Body            string         `json:"body,omitempty"`
+	SlackWebhookURL string         `json:"slack_webhook_url,omitempty"`
+
+	// Внутреннее состояние
 	mu             sync.Mutex
-	transport      http.RoundTripper
+	endpointStatuses map[string]bool // Хранит статус для каждого upstream'а (по его адресу)
+	httpClient     *http.Client
 }
 
-// CaddyModule returns module information.
-func (HealthCheck) CaddyModule() caddy.ModuleInfo {
+// CaddyModule возвращает информацию о модуле Caddy.
+func (SlackNotifierHealthChecker) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "http.reverse_proxy.health_check",
-		New: func() caddy.Module { return new(HealthCheck) },
+		// ID указывает, что это модуль health_checks для reverse_proxy
+		ID:  "http.reverse_proxy.health_checks.slack_notifier",
+		New: func() caddy.Module { return new(SlackNotifierHealthChecker) },
 	}
 }
 
-// Provision sets up the health check module.
-func (h *HealthCheck) Provision(ctx caddy.Context) error {
-	var err error
-	h.intervalDuration, err = time.ParseDuration(h.Interval)
-	if err != nil {
-		return fmt.Errorf("invalid interval: %w", err)
+// Provision настраивает модуль.
+func (s *SlackNotifierHealthChecker) Provision(ctx caddy.Context) error {
+	s.mu.Lock()
+	if s.endpointStatuses == nil {
+		s.endpointStatuses = make(map[string]bool)
 	}
-	h.timeoutDuration, err = time.ParseDuration(h.Timeout)
-	if err != nil {
-		return fmt.Errorf("invalid timeout: %w", err)
+	s.mu.Unlock()
+
+	// Создаем HTTP клиент с таймаутом
+	s.httpClient = &http.Client{
+		Timeout: time.Duration(s.Timeout),
+		// Важно: Настройте транспорт для игнорирования TLS ошибок, если нужно (не рекомендуется для прода)
+		// Transport: &http.Transport{
+		// 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// },
 	}
 
-    h.EndpointStatuses = make(map[string]bool)
-	h.EndpointStatuses[h.Upstream] = true // Изначально считаем все доступными
+    // Установка значений по умолчанию, если они не заданы
+    if s.Interval == 0 {
+        s.Interval = caddy.Duration(30 * time.Second) // Значение по умолчанию из Caddy
+    }
+    if s.Timeout == 0 {
+        s.Timeout = caddy.Duration(10 * time.Second) // Значение по умолчанию из Caddy
+    }
+    if s.URI == "" {
+        return fmt.Errorf("health check URI is required")
+    }
 
-	go h.startHealthChecks()
 
+	log.Printf("[INFO] SlackNotifierHealthChecker Provisioned: URI=%s, Interval=%v, Timeout=%v", s.URI, s.Interval, s.Timeout)
 	return nil
 }
-// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
-func (h *HealthCheck) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-        if !d.Args(&h.HealthURI) {
-            return d.ArgErr()
-        }
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "interval":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.Interval = d.Val()
-			case "timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.Timeout = d.Val()
-			case "body":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.HealthBody = d.Val()
-			case "to":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				h.Upstream = d.Val()
-			default:
-				return d.Errf("unknown option '%s'", d.Val())
+
+// Check выполняет проверку состояния для указанного upstream.
+// Реализует reverseproxy.UpstreamHealthChecker
+func (s *SlackNotifierHealthChecker) Check(ctx context.Context, upstream *reverseproxy.Upstream) error {
+	if upstream == nil || upstream.Dial == "" {
+		return fmt.Errorf("invalid upstream for health check")
+	}
+
+	checkURL, err := s.buildCheckURL(upstream)
+	if err != nil {
+		return fmt.Errorf("building health check URL: %w", err)
+	}
+
+	isAvailable, checkErr := s.performCheck(ctx, checkURL)
+
+	// Определяем адрес апстрима для хранения статуса
+	upstreamAddr := upstream.Dial
+
+	s.mu.Lock()
+	previousStatus, exists := s.endpointStatuses[upstreamAddr]
+	if !exists {
+		previousStatus = true // Предполагаем, что был здоров при первой проверке
+	}
+	currentStatus := isAvailable && checkErr == nil
+	s.endpointStatuses[upstreamAddr] = currentStatus
+	s.mu.Unlock()
+
+	// Отправляем уведомление, если статус изменился
+	if currentStatus != previousStatus {
+		var message string
+		if currentStatus {
+			message = fmt.Sprintf("Upstream %s is back online! (Checked %s)", upstreamAddr, s.URI)
+		} else {
+			errMsg := "unhealthy"
+			if checkErr != nil {
+				errMsg = fmt.Sprintf("check error: %v", checkErr)
 			}
+			message = fmt.Sprintf("Upstream %s is now DOWN! (Checked %s) - Reason: %s", upstreamAddr, s.URI, errMsg)
+		}
+		log.Println("[INFO]", message)
+		s.sendSlackNotification(message)
+	} else {
+         log.Printf("[DEBUG] SlackNotifierHealthChecker: Upstream %s status unchanged (%v)", upstreamAddr, currentStatus)
+    }
+
+	if checkErr != nil {
+		return checkErr // Возвращаем ошибку проверки
+	}
+	if !isAvailable {
+		return fmt.Errorf("upstream reported unhealthy status") // Возвращаем ошибку, если проверка прошла, но статус не OK
+	}
+
+	return nil // Все хорошо
+}
+
+// buildCheckURL строит URL для проверки состояния.
+func (s *SlackNotifierHealthChecker) buildCheckURL(upstream *reverseproxy.Upstream) (string, error) {
+	// Пытаемся определить схему (http или https)
+	scheme := "http"
+	if upstream.TLS != nil || strings.HasSuffix(upstream.Dial, ":443") { // Простое предположение
+		scheme = "https"
+	}
+
+	// Получаем хост и порт из upstream.Dial
+	host, port, err := net.SplitHostPort(upstream.Dial)
+	if err != nil {
+		// Если порт не указан, пробуем добавить стандартный
+		host = upstream.Dial
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+		// Попробуем снова разделить
+        if _, _, err := net.SplitHostPort(net.JoinHostPort(host, port)); err != nil {
+            return "", fmt.Errorf("invalid upstream address format '%s': %w", upstream.Dial, err)
+        }
+	}
+
+
+	// Собираем URL
+	// Убираем возможный префикс "/" и добавляем его снова, если нужно
+	uriPath := "/" + strings.TrimPrefix(s.URI, "/")
+
+	url := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, port), uriPath)
+	return url, nil
+}
+
+// performCheck выполняет сам HTTP-запрос для проверки.
+func (s *SlackNotifierHealthChecker) performCheck(ctx context.Context, checkURL string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
+	if err != nil {
+		return false, fmt.Errorf("creating request: %w", err)
+	}
+
+	// Добавляем User-Agent, как это делает Caddy
+	req.Header.Set("User-Agent", "Caddy-Health-Checker")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		log.Printf("[DEBUG] SlackNotifierHealthChecker: Request to %s failed: %v", checkURL, err)
+		return false, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Проверка статус-кода (2xx считается успехом)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("[DEBUG] SlackNotifierHealthChecker: Endpoint %s: Status code %d", checkURL, resp.StatusCode())
+		return false, nil // Не ошибка, просто недоступен
+	}
+
+	// Проверка тела ответа, если указано
+	if s.Body != "" {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("[DEBUG] SlackNotifierHealthChecker: Endpoint %s: Failed to read body: %v", checkURL, err)
+			return false, fmt.Errorf("reading response body: %w", err)
+		}
+		if !strings.Contains(string(bodyBytes), s.Body) {
+			log.Printf("[DEBUG] SlackNotifierHealthChecker: Endpoint %s: Body mismatch", checkURL)
+			return false, nil // Не ошибка, просто не соответствует
 		}
 	}
-	return nil
-}
-// ServeHTTP реализует caddyhttp.MiddlewareHandler.
-func (h HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	return next.ServeHTTP(w, r)
+
+	return true, nil
 }
 
-// startHealthChecks запускает периодические проверки доступности endpoints.
-func (h *HealthCheck) startHealthChecks() {
-	ticker := time.NewTicker(h.intervalDuration)
-	defer ticker.Stop()
 
-	for range ticker.C {
-		h.checkEndpoint(h.Upstream)
+// sendSlackNotification отправляет сообщение в Slack.
+func (s *SlackNotifierHealthChecker) sendSlackNotification(message string) {
+	slackURL := s.SlackWebhookURL
+	// Или из переменной окружения
+	if slackURL == "" {
+		slackURL = os.Getenv("SLACK_WEBHOOK_URL")
 	}
-}
 
-// checkEndpoint проверяет доступность endpoint и логирует, если статус изменился.
-func (h *HealthCheck) checkEndpoint(upstream string) {
-    slackURL := os.Getenv("SLACK_WEBHOOK_URL")
-    if slackURL == "" && h.SlackWebhookURL != ""{
-        slackURL = h.SlackWebhookURL
-    }
-	isAvailable, err := h.isEndpointAvailable(upstream)
-	if err != nil {
-		log.Printf("[ERROR] Error checking endpoint %s: %v", upstream, err)
-        if slackURL != "" {
-            h.sendSlackNotification(fmt.Sprintf("[ERROR] Error checking endpoint %s: %v", upstream, err), slackURL)
-        }
+	if slackURL == "" {
+		log.Println("[WARN] SlackNotifierHealthChecker: Slack webhook URL not configured, skipping notification.")
 		return
 	}
 
-	h.mu.Lock()
-	previousStatus := h.EndpointStatuses[upstream]
-	h.mu.Unlock()
-
-	if isAvailable != previousStatus {
-		h.mu.Lock()
-		h.EndpointStatuses[upstream] = isAvailable
-		h.mu.Unlock()
-
-		var message string
-		if isAvailable {
-			message = fmt.Sprintf("Upstream %s is back online!", upstream)
-		} else {
-			message = fmt.Sprintf("Upstream %s is now DOWN!", upstream)
-		}
-
-		log.Println(message)
-
-		// Отправляем уведомление в Slack, если URL настроен
-		if slackURL != "" {
-            h.sendSlackNotification(message, slackURL)
-		}
-	}
-}
-
-// isEndpointAvailable выполняет HTTP GET запрос к endpoint и возвращает true, если статус код 200-399 и тело соответствует health_body.
-func (h *HealthCheck) isEndpointAvailable(upstream string) (bool, error) {
-	client := resty.New()
-	client.SetTimeout(h.timeoutDuration)
-
-	endpoint := upstream + h.HealthURI
-
-	resp, err := client.R().Get(endpoint)
-	if err != nil {
-		return false, err
-	}
-
-	if resp.StatusCode() >= 200 && resp.StatusCode() < 400 {
-		if h.HealthBody != "" && strings.Contains(string(resp.Body()), h.HealthBody) {
-			return true, nil
-		} else if h.HealthBody == "" { // if health_body is not configured, just check status code
-			return true, nil
-		}
-
-		log.Printf("[DEBUG] Endpoint %s: Body does not match health_body", endpoint)
-		return false, nil
-
-	}
-
-	log.Printf("[DEBUG] Endpoint %s: Status code is %d", endpoint, resp.StatusCode())
-	return false, nil
-}
-
-// sendSlackNotification отправляет сообщение в Slack через webhook.
-func (h *HealthCheck) sendSlackNotification(message string, slackURL string) error {
 	payload := map[string]string{"text": message}
-
 	client := resty.New()
 	_, err := client.R().
 		SetHeader("Content-Type", "application/json").
 		SetBody(payload).
 		Post(slackURL)
-
-	return err
+	if err != nil {
+		log.Printf("[ERROR] SlackNotifierHealthChecker: Failed to send Slack notification: %v", err)
+	} else {
+        log.Printf("[INFO] SlackNotifierHealthChecker: Sent Slack notification for: %s", message)
+    }
 }
 
-func (h *HealthCheck) CheckConfig(handler *reverseproxy.Handler) error {
-    return nil
+// --- Caddyfile Unmarshaling ---
+
+// UnmarshalCaddyfile настраивает модуль из Caddyfile.
+func (s *SlackNotifierHealthChecker) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() { // Перебираем директивы внутри блока slack_notifier { ... }
+		switch d.Val() {
+		case "uri":
+			if !d.AllArgs(&s.URI) {
+				return d.ArgErr()
+			}
+		case "interval":
+			if !d.NextArg() { return d.ArgErr() }
+			dur, err := time.ParseDuration(d.Val())
+			if err != nil { return d.Errf("parsing interval duration '%s': %v", d.Val(), err) }
+			s.Interval = caddy.Duration(dur)
+		case "timeout":
+			if !d.NextArg() { return d.ArgErr() }
+			dur, err := time.ParseDuration(d.Val())
+			if err != nil { return d.Errf("parsing timeout duration '%s': %v", d.Val(), err) }
+			s.Timeout = caddy.Duration(dur)
+		case "body":
+			if !d.AllArgs(&s.Body) {
+				return d.ArgErr()
+			}
+		case "slack_webhook_url":
+			if !d.AllArgs(&s.SlackWebhookURL) {
+				return d.ArgErr()
+			}
+		default:
+			return d.Errf("unrecognized subdirective '%s'", d.Val())
+		}
+	}
+	return nil
 }
 
-func init() {
-	caddy.RegisterModule(HealthCheck{})
-}
+// Interface guards (убедимся, что все нужные интерфейсы реализованы)
+var (
+	_ caddy.Module                    = (*SlackNotifierHealthChecker)(nil)
+	_ caddy.Provisioner               = (*SlackNotifierHealthChecker)(nil)
+	_ caddyfile.Unmarshaler           = (*SlackNotifierHealthChecker)(nil)
+	_ reverseproxy.UpstreamHealthChecker = (*SlackNotifierHealthChecker)(nil) // Самый важный интерфейс!
+)
